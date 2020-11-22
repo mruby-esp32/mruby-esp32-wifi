@@ -55,8 +55,8 @@ event_handler(void *ctx, system_event_t *event)
         vTaskSuspend(ehc->task);
         int arena_index = mrb_gc_arena_save(ehc->mrb);
 
-        mrb_value mrb_ip_str = mrb_str_buf_new(ehc->mrb, 13);
-        char ip_str[13];
+        mrb_value mrb_ip_str = mrb_str_buf_new(ehc->mrb, 16);
+        char ip_str[16];
         sprintf(ip_str, IPSTR, IP2STR(&event->event_info.got_ip.ip_info.ip));
         mrb_str_cat_cstr(ehc->mrb, mrb_ip_str, ip_str);
 
