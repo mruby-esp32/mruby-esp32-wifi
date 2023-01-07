@@ -126,7 +126,6 @@ mrb_esp32_wifi_init(mrb_state *mrb, mrb_value self) {
   
 	wifi_event_group = xEventGroupCreate();
 
-  ESP_ERROR_CHECK(esp_event_loop_create_default());
   ESP_ERROR_CHECK(
     esp_event_handler_instance_register(
       WIFI_EVENT,
@@ -207,7 +206,9 @@ mrb_esp32_wifi_set_on_disconnected(mrb_state *mrb, mrb_value self) {
 
 void
 mrb_mruby_esp32_wifi_gem_init(mrb_state* mrb) {
-  tcpip_adapter_init();
+  ESP_ERROR_CHECK(esp_netif_init());
+  ESP_ERROR_CHECK(esp_event_loop_create_default());
+  esp_netif_create_default_wifi_sta();
 
   struct RClass *esp32_module = mrb_define_module(mrb, "ESP32");
   struct RClass *esp32_wifi_class = mrb_define_class_under(mrb, esp32_module, "WiFi", mrb->object_class);
