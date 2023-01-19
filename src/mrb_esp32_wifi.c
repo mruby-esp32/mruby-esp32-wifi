@@ -12,7 +12,7 @@
 
 #include "esp_system.h"
 #include "esp_wifi.h"
-#include "esp_event_loop.h"
+#include "esp_event.h"
 
 #include "lwip/err.h"
 #include "lwip/sockets.h"
@@ -22,11 +22,7 @@
 
 const int CONNECTED_BIT = BIT0;
 
-static void
-mrb_eh_ctx_t_free(mrb_state *mrb, void *p) {
-  esp_event_loop_set_cb(NULL, NULL);
-  mrb_free(mrb, p);
-}
+static void mrb_eh_ctx_t_free(mrb_state *mrb, void *p);
 
 static const struct mrb_data_type mrb_eh_ctx_t = {
   "$i_mrb_eh_ctx_t", mrb_eh_ctx_t_free
@@ -38,39 +34,33 @@ typedef struct eh_ctx_t {
   mrb_state *mrb;
   mrb_value on_connected_blk;
   mrb_value on_disconnected_blk;
+  esp_event_handler_instance_t wifi_event_handler_instance;
+  esp_event_handler_instance_t ip_event_handler_instance;
 } eh_ctx_t;
 
-static esp_err_t 
-event_handler(void *ctx, system_event_t *event)
-{
-  eh_ctx_t *ehc = (eh_ctx_t *)ctx;
+static void
+mrb_eh_ctx_t_free(mrb_state *mrb, void *p) {
+  eh_ctx_t *ehc = (eh_ctx_t *)p;
 
-  switch(event->event_id) {
-    case SYSTEM_EVENT_STA_START:
+  if (ehc->wifi_event_handler_instance != NULL) {
+    ESP_ERROR_CHECK(esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, ehc->wifi_event_handler_instance));
+  }
+  if (ehc->ip_event_handler_instance != NULL) {
+    ESP_ERROR_CHECK(esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, ehc->ip_event_handler_instance));
+  }
+  mrb_free(mrb, p);
+}
+
+static void
+wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
+  eh_ctx_t *ehc = (eh_ctx_t *)arg;
+
+  switch(event_id) {
+    case WIFI_EVENT_STA_START:
       esp_wifi_connect();
       break;
-    case SYSTEM_EVENT_STA_GOT_IP:
-      xEventGroupSetBits(wifi_event_group, CONNECTED_BIT);
-      if (ehc != NULL) {
-        vTaskSuspend(ehc->task);
-        int arena_index = mrb_gc_arena_save(ehc->mrb);
-
-        mrb_value mrb_ip_str = mrb_str_buf_new(ehc->mrb, INET_ADDRSTRLEN);
-        char ip_str[INET_ADDRSTRLEN];
-        sprintf(ip_str, IPSTR, IP2STR(&event->event_info.got_ip.ip_info.ip));
-        mrb_str_cat_cstr(ehc->mrb, mrb_ip_str, ip_str);
-
-        if (!mrb_nil_p(ehc->on_connected_blk)) {
-          mrb_assert(mrb_type(ehc->on_connected_blk) == MRB_TT_PROC);
-          mrb_yield_argv(ehc->mrb, ehc->on_connected_blk, 1, &mrb_ip_str);
-        }
-
-        mrb_gc_arena_restore(ehc->mrb, arena_index);
-        vTaskResume(ehc->task);
-      }
-      break;
-    case SYSTEM_EVENT_STA_DISCONNECTED:
-      // This is a workaround as ESP32 WiFi libs don't currently auto-reassociate. 
+    case WIFI_EVENT_STA_DISCONNECTED:
+      // This is a workaround as ESP32 WiFi libs don't currently auto-reassociate.
       esp_wifi_connect();
       xEventGroupClearBits(wifi_event_group, CONNECTED_BIT);
       if (ehc != NULL) {
@@ -87,9 +77,39 @@ event_handler(void *ctx, system_event_t *event)
       }
       break;
     default:
-        break;
+      break;
   }
-  return ESP_OK;
+}
+
+static void
+ip_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
+  eh_ctx_t *ehc = (eh_ctx_t *)arg;
+
+  switch(event_id) {
+    case IP_EVENT_STA_GOT_IP:
+      xEventGroupSetBits(wifi_event_group, CONNECTED_BIT);
+      if (ehc != NULL) {
+        vTaskSuspend(ehc->task);
+        int arena_index = mrb_gc_arena_save(ehc->mrb);
+
+        mrb_value mrb_ip_str = mrb_str_buf_new(ehc->mrb, INET_ADDRSTRLEN);
+        char ip_str[INET_ADDRSTRLEN];
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        sprintf(ip_str, IPSTR, IP2STR(&event->ip_info.ip));
+        mrb_str_cat_cstr(ehc->mrb, mrb_ip_str, ip_str);
+
+        if (!mrb_nil_p(ehc->on_connected_blk)) {
+          mrb_assert(mrb_type(ehc->on_connected_blk) == MRB_TT_PROC);
+          mrb_yield_argv(ehc->mrb, ehc->on_connected_blk, 1, &mrb_ip_str);
+        }
+
+        mrb_gc_arena_restore(ehc->mrb, arena_index);
+        vTaskResume(ehc->task);
+      }
+      break;
+    default:
+      break;
+  }
 }
 
 static mrb_value
@@ -99,12 +119,32 @@ mrb_esp32_wifi_init(mrb_state *mrb, mrb_value self) {
   ehc->mrb = mrb;
   ehc->on_connected_blk = mrb_nil_value();
   ehc->on_disconnected_blk = mrb_nil_value();
+  ehc->wifi_event_handler_instance = NULL;
+  ehc->ip_event_handler_instance = NULL;
 
   mrb_data_init(self, ehc, &mrb_eh_ctx_t);
   
 	wifi_event_group = xEventGroupCreate();
 
-	ESP_ERROR_CHECK( esp_event_loop_init(event_handler, (eh_ctx_t *) DATA_PTR(self)) );
+  ESP_ERROR_CHECK(esp_event_loop_create_default());
+  ESP_ERROR_CHECK(
+    esp_event_handler_instance_register(
+      WIFI_EVENT,
+      ESP_EVENT_ANY_ID,
+      &wifi_event_handler,
+      (eh_ctx_t *)DATA_PTR(self),
+      &ehc->wifi_event_handler_instance
+    )
+  );
+  ESP_ERROR_CHECK(
+    esp_event_handler_instance_register(
+      IP_EVENT,
+      IP_EVENT_STA_GOT_IP,
+      &ip_event_handler,
+      (eh_ctx_t *)DATA_PTR(self),
+      &ehc->ip_event_handler_instance
+    )
+  );
 
   return self;
 }
