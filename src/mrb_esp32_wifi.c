@@ -133,7 +133,6 @@ mrb_esp32_wifi_wait_for_event(mrb_state *mrb, mrb_value self, mrb_esp32_wifi_eve
   eh_ctx_t *ehc = (eh_ctx_t *) DATA_PTR(self);
   mrb_esp32_wifi_event_t ev;
   int wait_count;
-  struct RClass* error_class;
 
   for(wait_count = 0 ; wait_count < WAIT_EVENT_TIMEOUT_SEC ; wait_count++) {
     if(xQueueReceive(ehc->queue, (void*)&ev, (TickType_t)(1000 / portTICK_PERIOD_MS))) {
