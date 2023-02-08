@@ -20,6 +20,9 @@
 #include "lwip/netdb.h"
 #include "lwip/dns.h"
 
+#define WAIT_EVENT_TIMEOUT_SEC (20)
+#define WAIT_EVENT_QUEUE_LEN (10)
+
 const int CONNECTED_BIT = BIT0;
 
 static void mrb_eh_ctx_t_free(mrb_state *mrb, void *p);
@@ -27,6 +30,12 @@ static void mrb_eh_ctx_t_free(mrb_state *mrb, void *p);
 static const struct mrb_data_type mrb_eh_ctx_t = {
   "$i_mrb_eh_ctx_t", mrb_eh_ctx_t_free
 };
+
+typedef enum {
+  MRB_ESP32_WIFI_CONNECTED,
+  MRB_ESP32_WIFI_DISCONNECTED,
+  MRB_ESP32_WIFI_MAX
+} mrb_esp32_wifi_event_t;
 
 static EventGroupHandle_t wifi_event_group;
 typedef struct eh_ctx_t {
@@ -36,6 +45,7 @@ typedef struct eh_ctx_t {
   mrb_value on_disconnected_blk;
   esp_event_handler_instance_t wifi_event_handler_instance;
   esp_event_handler_instance_t ip_event_handler_instance;
+  QueueHandle_t queue;
 } eh_ctx_t;
 
 static void
@@ -64,6 +74,9 @@ wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, voi
       esp_wifi_connect();
       xEventGroupClearBits(wifi_event_group, CONNECTED_BIT);
       if (ehc != NULL) {
+        mrb_esp32_wifi_event_t ev = MRB_ESP32_WIFI_DISCONNECTED;
+        xQueueSend(ehc->queue, (void*)&ev, (TickType_t)0);
+
         vTaskSuspend(ehc->task);
         int arena_index = mrb_gc_arena_save(ehc->mrb);
 
@@ -89,6 +102,9 @@ ip_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void*
     case IP_EVENT_STA_GOT_IP:
       xEventGroupSetBits(wifi_event_group, CONNECTED_BIT);
       if (ehc != NULL) {
+        mrb_esp32_wifi_event_t ev = MRB_ESP32_WIFI_CONNECTED;
+        xQueueSend(ehc->queue, (void*)&ev, (TickType_t)0);
+
         vTaskSuspend(ehc->task);
         int arena_index = mrb_gc_arena_save(ehc->mrb);
 
@@ -112,6 +128,21 @@ ip_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void*
   }
 }
 
+static void
+mrb_esp32_wifi_wait_for_event(mrb_state *mrb, mrb_value self, mrb_esp32_wifi_event_t event_id) {
+  eh_ctx_t *ehc = (eh_ctx_t *) DATA_PTR(self);
+  mrb_esp32_wifi_event_t ev;
+  int wait_count;
+  struct RClass* error_class;
+
+  for(wait_count = 0 ; wait_count < WAIT_EVENT_TIMEOUT_SEC ; wait_count++) {
+    if(xQueueReceive(ehc->queue, (void*)&ev, (TickType_t)(1000 / portTICK_PERIOD_MS))) {
+      if(ev == event_id) return;
+    }
+  }
+  mrb_raise(mrb, mrb->eException_class, "Timeout wait for wifi event.");
+}
+
 static mrb_value
 mrb_esp32_wifi_init(mrb_state *mrb, mrb_value self) {
   eh_ctx_t *ehc = mrb_malloc(mrb, sizeof(eh_ctx_t));
@@ -121,6 +152,7 @@ mrb_esp32_wifi_init(mrb_state *mrb, mrb_value self) {
   ehc->on_disconnected_blk = mrb_nil_value();
   ehc->wifi_event_handler_instance = NULL;
   ehc->ip_event_handler_instance = NULL;
+  ehc->queue = xQueueCreate(WAIT_EVENT_QUEUE_LEN, sizeof(mrb_esp32_wifi_event_t));
 
   mrb_data_init(self, ehc, &mrb_eh_ctx_t);
   
@@ -168,6 +200,8 @@ mrb_esp32_wifi_connect(mrb_state *mrb, mrb_value self) {
 	ESP_ERROR_CHECK( esp_wifi_set_config(WIFI_IF_STA, &wifi_config) );
 	ESP_ERROR_CHECK( esp_wifi_start() );
 
+  mrb_esp32_wifi_wait_for_event(mrb, self, MRB_ESP32_WIFI_CONNECTED);
+
   return self;
 }
 
@@ -175,6 +209,8 @@ static mrb_value
 mrb_esp32_wifi_disconnect(mrb_state *mrb, mrb_value self) {
   ESP_ERROR_CHECK( esp_wifi_stop() );
   
+  mrb_esp32_wifi_wait_for_event(mrb, self, MRB_ESP32_WIFI_DISCONNECTED);
+
   return self;
 }
 
